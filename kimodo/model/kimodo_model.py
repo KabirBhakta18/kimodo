@@ -64,6 +64,29 @@ class Kimodo(nn.Module):
             return self.skeleton.somaskel77
         return self.skeleton
 
+    @staticmethod
+    def _prepare_heading_angle(
+        first_heading_angle: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Normalize heading angles to a [B] tensor on the target device."""
+        if first_heading_angle is None:
+            return torch.zeros(batch_size, device=device)
+
+        heading = torch.as_tensor(first_heading_angle, device=device)
+        heading = heading.reshape(-1)
+
+        if heading.numel() == 1:
+            return heading.repeat(batch_size)
+
+        if heading.numel() != batch_size:
+            raise ValueError(
+                f"Expected first_heading_angle to have {batch_size} values, got {heading.numel()}"
+            )
+
+        return heading
+
     def train(self, mode: bool):
         self.denoiser.train(mode)
         return self
@@ -125,8 +148,8 @@ class Kimodo(nn.Module):
         prompts: list[str],
         num_frames: int | list[int],
         num_denoising_steps: int,
-        constraint_lst: Optional[list] = [],
-        cfg_weight: Optional[float] = [2.0, 2.0],
+        constraint_lst: Optional[list] = None,
+        cfg_weight: Optional[Union[float, Tuple[float, float], List[float]]] = None,
         num_samples: Optional[int] = None,
         cfg_type: Optional[str] = None,
         return_numpy: bool = False,
@@ -141,20 +164,24 @@ class Kimodo(nn.Module):
     ) -> torch.Tensor:
         device = self.device
 
-        bs = num_samples
-        texts = sanitize_texts(prompts)
+        if cfg_weight is None:
+            cfg_weight = [2.0, 2.0]
 
-        if isinstance(num_frames, int):
-            # same duration for all the segments
-            num_frames = [num_frames for _ in range(num_samples)]
+        if constraint_lst is None:
+            constraint_lst = []
+
+        texts = sanitize_texts(prompts)
 
         tosqueeze = False
         if num_samples is None:
             num_samples = 1
             tosqueeze = True
 
-        if constraint_lst is None:
-            constraint_lst = []
+        if isinstance(num_frames, int):
+            # same duration for all the segments
+            num_frames = [num_frames for _ in range(num_samples)]
+
+        bs = num_samples
 
         # Generate one chunck at a time
         current_frame = 0
@@ -254,13 +281,7 @@ class Kimodo(nn.Module):
                 lengths = lengths + transition_lengths
                 first_heading_angle = compute_heading_angle(last_output["posed_joints"], self.skeleton)[:, 0]
             else:
-                if first_heading_angle is None:
-                    # Start at 0 angle, but this will change afterward
-                    first_heading_angle = torch.tensor([0.0] * bs, device=device)
-                else:
-                    first_heading_angle = torch.as_tensor(first_heading_angle, device=device)
-                    if first_heading_angle.numel() == 1:
-                        first_heading_angle = first_heading_angle.repeat(bs)
+                first_heading_angle = self._prepare_heading_angle(first_heading_angle, bs, device)
 
             observed_motion = self.motion_rep.normalize(observed_motion)
 
@@ -383,8 +404,8 @@ class Kimodo(nn.Module):
         num_frames: int | list[int],
         num_denoising_steps: int,
         multi_prompt: bool = False,
-        constraint_lst: Optional[list] = [],
-        cfg_weight: Optional[float] = [2.0, 2.0],
+        constraint_lst: Optional[list] = None,
+        cfg_weight: Optional[Union[float, Tuple[float, float], List[float]]] = None,
         num_samples: Optional[int] = None,
         cfg_type: Optional[str] = None,
         return_numpy: bool = False,
@@ -452,6 +473,12 @@ class Kimodo(nn.Module):
         """
         device = self.device
 
+        if cfg_weight is None:
+            cfg_weight = [2.0, 2.0]
+
+        if constraint_lst is None:
+            constraint_lst = []
+
         if multi_prompt:
             # multi prompt generation
             return self._multiprompt(
@@ -473,7 +500,8 @@ class Kimodo(nn.Module):
         # Input checking
         tosqueeze = False
         if isinstance(prompts, list) and isinstance(num_frames, list):
-            assert len(prompts) == len(num_frames), "The number of prompts should match the number of num_frames."
+            if len(prompts) != len(num_frames):
+                raise ValueError("The number of prompts should match the number of num_frames.")
             num_samples = len(prompts)
         elif isinstance(prompts, list):
             num_samples = len(prompts)
@@ -498,13 +526,7 @@ class Kimodo(nn.Module):
         max_frames = max(lengths)
         motion_pad_mask = length_to_mask(lengths)
 
-        if first_heading_angle is None:
-            # Start at 0 angle
-            first_heading_angle = torch.tensor([0.0] * bs, device=device)
-        else:
-            first_heading_angle = torch.as_tensor(first_heading_angle, device=device)
-            if first_heading_angle.numel() == 1:
-                first_heading_angle = first_heading_angle.repeat(bs)
+        first_heading_angle = self._prepare_heading_angle(first_heading_angle, bs, device)
 
         observed_motion, motion_mask = None, None
         if constraint_lst:
